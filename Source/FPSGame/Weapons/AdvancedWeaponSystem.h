@@ -16,6 +16,9 @@ class APerformanceOptimizationSystem;
 class AAdvancedHUDSystem;
 class AAdvancedAudioSystem;
 class UAdvancedWeaponComponent;
+class UWeaponPoolingIntegrationComponent;
+class AAdvancedAudioSystem;
+class UAdvancedWeaponComponent;
 
 UENUM(BlueprintType)
 enum class EWeaponType : uint8
@@ -210,7 +213,7 @@ class FPSGAME_API UAdvancedWeaponSystem : public UActorComponent
     GENERATED_BODY()
 
 public:
-    AAdvancedWeaponSystem();
+    UAdvancedWeaponSystem();
 
 protected:
     virtual void BeginPlay() override;
@@ -230,6 +233,10 @@ public:
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
     UStaticMeshComponent* SightComponent;
+
+    // Pooling Integration Component
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
+    UWeaponPoolingIntegrationComponent* PoolingComponent;
 
     // Weapon Configuration
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Config", Replicated)
@@ -525,6 +532,12 @@ private:
     void CheckForJam();
     void InitializeFromDataTable();
     void LoadWeaponAssets();
+
+    // Shell ejection and tracer helper functions
+    void SpawnShellEjection();
+    FVector GetShellEjectionLocation() const;
+    FVector GetShellEjectionVelocity() const;
+    bool ShouldSpawnTracer() const;
 
     // Network replication functions
     UFUNCTION()

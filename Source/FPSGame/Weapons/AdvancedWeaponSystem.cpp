@@ -17,6 +17,7 @@
 #include "Sound/SoundCue.h"
 #include "Particles/ParticleSystemComponent.h"
 #include "Camera/CameraShakeBase.h"
+#include "WeaponPoolingIntegrationComponent.h"
 
 DEFINE_LOG_CATEGORY(LogAdvancedWeapon);
 
@@ -65,6 +66,9 @@ UAdvancedWeaponSystem::UAdvancedWeaponSystem()
     // Create audio component
     AudioComponent = CreateDefaultSubobject<UAudioComponent>(TEXT("AudioComponent"));
     AudioComponent->SetupAttachment(WeaponMesh);
+    
+    // Create weapon pooling integration component
+    PoolingComponent = CreateDefaultSubobject<UWeaponPoolingIntegrationComponent>(TEXT("PoolingComponent"));
 }
 
 void UAdvancedWeaponSystem::BeginPlay()
@@ -75,6 +79,12 @@ void UAdvancedWeaponSystem::BeginPlay()
     if (WeaponData)
     {
         InitializeFromWeaponData();
+    }
+    
+    // Initialize pooling component
+    if (PoolingComponent)
+    {
+        PoolingComponent->InitializeForWeapon(this);
     }
     
     // Set up timers
@@ -189,7 +199,14 @@ void UAdvancedWeaponSystem::PerformFire()
     else
     {
         PerformHitscan(StartLocation, FireDirection);
+        
+        // Spawn tracer for hitscan (visual representation of bullet path)
+        FVector EndLocation = StartLocation + (FireDirection * GetEffectiveRange());
+        SpawnTracer(StartLocation, EndLocation);
     }
+    
+    // Spawn shell ejection
+    SpawnShellEjection();
     
     // Play effects
     PlayFireEffects();
@@ -291,6 +308,36 @@ void UAdvancedWeaponSystem::SpawnProjectile(const FVector& StartLocation, const 
 {
     if (!ProjectileClass) return;
     
+    // Use pooled projectile if pooling component is available
+    if (PoolingComponent)
+    {
+        if (AActor* PooledProjectile = PoolingComponent->GetPooledProjectile(ProjectileClass))
+        {
+            // Set up pooled projectile
+            PooledProjectile->SetActorLocation(StartLocation);
+            PooledProjectile->SetActorRotation(Direction.Rotation());
+            PooledProjectile->SetOwner(GetOwner());
+            PooledProjectile->SetInstigator(Cast<APawn>(GetOwner()));
+            
+            // Set initial velocity and ballistic properties
+            if (UProjectileMovementComponent* ProjectileMovement = PooledProjectile->FindComponentByClass<UProjectileMovementComponent>())
+            {
+                ProjectileMovement->InitialSpeed = MuzzleVelocity;
+                ProjectileMovement->MaxSpeed = MuzzleVelocity;
+                ProjectileMovement->ProjectileGravityScale = GravityMultiplier;
+                ProjectileMovement->Velocity = Direction * MuzzleVelocity;
+            }
+            
+            // Activate the pooled projectile
+            PooledProjectile->SetActorHiddenInGame(false);
+            PooledProjectile->SetActorEnableCollision(true);
+            PooledProjectile->SetActorTickEnabled(true);
+            
+            return;
+        }
+    }
+    
+    // Fallback to traditional spawning if pooling is not available
     FActorSpawnParameters SpawnParams;
     SpawnParams.Owner = GetOwner();
     SpawnParams.Instigator = Cast<APawn>(GetOwner());
@@ -327,8 +374,15 @@ void UAdvancedWeaponSystem::PerformHitscan(const FVector& StartLocation, const F
             float Damage = CalculateDamage(Hit);
             ApplyDamage(Hit.GetActor(), Damage, Hit);
             
-            // Spawn impact effects
-            SpawnImpactEffects(Hit);
+            // Spawn impact effects using pooled objects
+            if (PoolingComponent)
+            {
+                PoolingComponent->SpawnImpactEffect(Hit.Location, Hit.Normal, Hit.PhysMaterial.Get());
+            }
+            else
+            {
+                SpawnImpactEffects(Hit);
+            }
         }
     }
 }
@@ -565,20 +619,30 @@ FVector UAdvancedWeaponSystem::GetMuzzleLocation() const
 
 void UAdvancedWeaponSystem::PlayFireEffects()
 {
-    // Play muzzle flash
-    if (MuzzleFlash)
+    // Use pooled muzzle flash if available
+    if (PoolingComponent)
     {
+        PoolingComponent->PlayMuzzleFlash(GetMuzzleLocation(), GetOwner()->GetActorRotation());
+    }
+    else if (MuzzleFlash)
+    {
+        // Fallback to traditional muzzle flash
         MuzzleFlash->ActivateSystem();
     }
     
-    // Play fire sound
-    if (FireSound && AudioComponent)
+    // Use pooled audio if available
+    if (PoolingComponent && FireSound)
     {
+        PoolingComponent->PlayWeaponSound(FireSound, GetMuzzleLocation());
+    }
+    else if (FireSound && AudioComponent)
+    {
+        // Fallback to traditional audio
         AudioComponent->SetSound(FireSound);
         AudioComponent->Play();
     }
     
-    // Play fire animation
+    // Play fire animation (not pooled)
     if (FireAnimation && WeaponMesh && WeaponMesh->GetAnimInstance())
     {
         WeaponMesh->GetAnimInstance()->Montage_Play(FireAnimation);
@@ -596,14 +660,19 @@ void UAdvancedWeaponSystem::PlayFireEffects()
 
 void UAdvancedWeaponSystem::PlayReloadEffects()
 {
-    // Play reload sound
-    if (ReloadSound && AudioComponent)
+    // Use pooled audio if available
+    if (PoolingComponent && ReloadSound)
     {
+        PoolingComponent->PlayWeaponSound(ReloadSound, GetOwner()->GetActorLocation());
+    }
+    else if (ReloadSound && AudioComponent)
+    {
+        // Fallback to traditional audio
         AudioComponent->SetSound(ReloadSound);
         AudioComponent->Play();
     }
     
-    // Play reload animation
+    // Play reload animation (not pooled)
     if (ReloadAnimation && WeaponMesh && WeaponMesh->GetAnimInstance())
     {
         WeaponMesh->GetAnimInstance()->Montage_Play(ReloadAnimation);
@@ -612,25 +681,34 @@ void UAdvancedWeaponSystem::PlayReloadEffects()
 
 void UAdvancedWeaponSystem::SpawnImpactEffects(const FHitResult& Hit)
 {
-    // Spawn impact particle effect
-    if (ImpactEffect)
+    // Use pooled impact effects if available
+    if (PoolingComponent)
     {
-        UGameplayStatics::SpawnEmitterAtLocation(
-            GetWorld(),
-            ImpactEffect,
-            Hit.Location,
-            Hit.Normal.Rotation()
-        );
+        PoolingComponent->SpawnImpactEffect(Hit.Location, Hit.Normal, Hit.PhysMaterial.Get());
     }
-    
-    // Play impact sound
-    if (ImpactSound)
+    else
     {
-        UGameplayStatics::PlaySoundAtLocation(
-            GetWorld(),
-            ImpactSound,
-            Hit.Location
-        );
+        // Fallback to traditional impact effects
+        // Spawn impact particle effect
+        if (ImpactEffect)
+        {
+            UGameplayStatics::SpawnEmitterAtLocation(
+                GetWorld(),
+                ImpactEffect,
+                Hit.Location,
+                Hit.Normal.Rotation()
+            );
+        }
+        
+        // Play impact sound
+        if (ImpactSound)
+        {
+            UGameplayStatics::PlaySoundAtLocation(
+                GetWorld(),
+                ImpactSound,
+                Hit.Location
+            );
+        }
     }
 }
 
@@ -1044,4 +1122,122 @@ float UAdvancedWeaponSystem::CalculateWeaponPerformanceScore(const FWeaponStats&
     Score += (2.0f - FMath::Min(Stats.HorizontalRecoil, 2.0f)) * 7.5f;
     
     return FMath::Max(Score, 0.0f);
+}
+
+// Add shell ejection and tracer functions with pooling integration
+
+void UAdvancedWeaponSystem::SpawnShellEjection()
+{
+    // Get shell ejection socket location
+    FVector EjectionLocation = GetShellEjectionLocation();
+    FRotator EjectionRotation = GetOwner()->GetActorRotation();
+    
+    // Use pooled shell ejection if available
+    if (PoolingComponent)
+    {
+        PoolingComponent->SpawnShellEjection(EjectionLocation, EjectionRotation, GetShellEjectionVelocity());
+    }
+    else if (ShellEjectEffect)
+    {
+        // Fallback to traditional shell ejection
+        UGameplayStatics::SpawnEmitterAtLocation(
+            GetWorld(),
+            ShellEjectEffect,
+            EjectionLocation,
+            EjectionRotation
+        );
+    }
+}
+
+void UAdvancedWeaponSystem::SpawnTracer(const FVector& StartLocation, const FVector& EndLocation)
+{
+    // Check if we should spawn a tracer (every nth shot or for tracer rounds)
+    if (!ShouldSpawnTracer())
+    {
+        return;
+    }
+    
+    // Use pooled tracer if available
+    if (PoolingComponent)
+    {
+        PoolingComponent->SpawnTracer(StartLocation, EndLocation, MuzzleVelocity);
+    }
+    else if (TracerEffect)
+    {
+        // Fallback to traditional tracer spawning
+        FVector TracerDirection = (EndLocation - StartLocation).GetSafeNormal();
+        FRotator TracerRotation = TracerDirection.Rotation();
+        
+        UGameplayStatics::SpawnEmitterAtLocation(
+            GetWorld(),
+            TracerEffect,
+            StartLocation,
+            TracerRotation
+        );
+    }
+}
+
+FVector UAdvancedWeaponSystem::GetShellEjectionLocation() const
+{
+    if (WeaponMesh)
+    {
+        // Try to get shell ejection socket
+        if (WeaponMesh->DoesSocketExist(TEXT("ShellEjectSocket")))
+        {
+            return WeaponMesh->GetSocketLocation(TEXT("ShellEjectSocket"));
+        }
+        
+        // Fallback to muzzle socket with offset
+        FVector MuzzleLocation = WeaponMesh->GetSocketLocation(TEXT("MuzzleSocket"));
+        FVector RightVector = GetOwner()->GetActorRightVector();
+        FVector UpVector = GetOwner()->GetActorUpVector();
+        
+        // Offset shell ejection to the right and slightly up from muzzle
+        return MuzzleLocation + (RightVector * 10.0f) + (UpVector * 5.0f);
+    }
+    
+    // Ultimate fallback
+    return GetOwner()->GetActorLocation() + GetOwner()->GetActorRightVector() * 50.0f;
+}
+
+FVector UAdvancedWeaponSystem::GetShellEjectionVelocity() const
+{
+    // Calculate shell ejection velocity based on weapon orientation
+    FVector RightVector = GetOwner()->GetActorRightVector();
+    FVector UpVector = GetOwner()->GetActorUpVector();
+    FVector ForwardVector = GetOwner()->GetActorForwardVector();
+    
+    // Shell ejects to the right, slightly up and back
+    FVector EjectionDirection = (RightVector * 0.7f) + (UpVector * 0.3f) + (ForwardVector * -0.1f);
+    EjectionDirection.Normalize();
+    
+    // Base ejection speed (can be modified by weapon type)
+    float EjectionSpeed = 200.0f;
+    
+    // Apply some randomness for realism
+    EjectionSpeed += FMath::RandRange(-50.0f, 50.0f);
+    EjectionDirection += FVector(
+        FMath::RandRange(-0.1f, 0.1f),
+        FMath::RandRange(-0.1f, 0.1f),
+        FMath::RandRange(-0.1f, 0.1f)
+    );
+    EjectionDirection.Normalize();
+    
+    return EjectionDirection * EjectionSpeed;
+}
+
+bool UAdvancedWeaponSystem::ShouldSpawnTracer() const
+{
+    // Spawn tracer every 5th shot for visibility
+    static int32 ShotCount = 0;
+    ShotCount++;
+    
+    // For automatic weapons, show every 5th tracer
+    if (CurrentFireMode == EFireMode::FullAuto)
+    {
+        return (ShotCount % 5 == 0);
+    }
+    
+    // For semi-automatic, show every tracer
+    return true;
 }
