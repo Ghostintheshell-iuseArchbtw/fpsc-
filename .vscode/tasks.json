@@ -1,0 +1,23 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build Unreal Project",
+			"type": "shell",
+			"command": "UnrealBuildTool",
+			"args": [
+				"FPSGame",
+				"Linux",
+				"Development",
+				"-Project=${workspaceFolder}/FPSGame.uproject",
+				"-WaitMutex",
+				"-FromMsBuild"
+			],
+			"group": "build",
+			"problemMatcher": [
+				"$gcc"
+			],
+			"isBackground": false
+		}
+	]
+}
