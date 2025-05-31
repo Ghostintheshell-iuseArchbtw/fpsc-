@@ -950,3 +950,208 @@ void FAdvancedObjectPool<T>::PerformHealthCheck()
     LastHealthCheckTime = CurrentTime;
     UpdateStatistics(); // Update stats after potential changes
 }
+
+// Missing template method implementations
+
+template<typename T>
+void FAdvancedObjectPool<T>::PrewarmPool()
+{
+    // InitializePool already handles prewarming if Config.bPrewarmPool is true
+    // This method can be called separately to add more objects
+    FScopeLock Lock(&PoolMutex);
+    
+    if (!bInitialized)
+    {
+        InitializePool();
+        return;
+    }
+    
+    // Add additional objects up to InitialSize if current pool is smaller
+    int32 CurrentSize = Pool.Num();
+    int32 TargetSize = Config.InitialSize;
+    
+    if (CurrentSize < TargetSize)
+    {
+        double CurrentTime = FPlatformTime::Seconds();
+        for (int32 i = CurrentSize; i < TargetSize; ++i)
+        {
+            T* NewRawObject = CreateNewObjectInternal();
+            if (NewRawObject)
+            {
+                int32 NewIndex = Pool.Emplace();
+                FAdvancedPooledObject& PooledObject = Pool[NewIndex];
+                PooledObject.Object = NewRawObject;
+                PooledObject.CreationTime = CurrentTime;
+                PooledObject.LastUsedTime = CurrentTime;
+                PooledObject.ObjectID = FString::Printf(TEXT("%s_PoolObj_%d"), *ObjectClass->GetName(), NewIndex);
+                if (Config.bEnableMemoryTracking)
+                {
+                    PooledObject.MemoryFootprintKB = CalculateMemoryFootprint(NewRawObject);
+                }
+                
+                AvailableIndices.Enqueue(NewIndex);
+                Statistics.TotalCreations++;
+            }
+        }
+        Statistics.CurrentPooledObjects = Pool.Num();
+        Statistics.AvailableObjects = AvailableIndices.Num();
+        
+        if (Config.bEnableDebugLogging) 
+        {
+            UE_LOG(LogObjectPool, Log, TEXT("Pool [%s]: Prewarmed pool from %d to %d objects"), 
+                   *ObjectClass->GetName(), CurrentSize, Pool.Num());
+        }
+    }
+}
+
+template<typename T>
+void FAdvancedObjectPool<T>::DestroyPool()
+{
+    FScopeLock Lock(&PoolMutex);
+    
+    if (Config.bEnableDebugLogging) 
+    {
+        UE_LOG(LogObjectPool, Log, TEXT("Pool [%s]: Destroying pool with %d objects"), 
+               *ObjectClass->GetName(), Pool.Num());
+    }
+    
+    // Destroy all objects in the pool
+    for (int32 i = 0; i < Pool.Num(); ++i)
+    {
+        DestroyObjectInternal(i);
+    }
+    
+    // Clear all containers
+    Pool.Empty();
+    AvailableIndices = TQueue<int32>();
+    ObjectToIndexMap.Empty();
+    
+    // Reset state
+    bInitialized = false;
+    Statistics = FPoolStatistics();
+    Statistics.MaxPoolSize = Config.MaxSize;
+    
+    if (Config.bEnableDebugLogging) 
+    {
+        UE_LOG(LogObjectPool, Log, TEXT("Pool [%s]: Pool destroyed successfully"), 
+               *ObjectClass->GetName());
+    }
+}
+
+template<typename T>
+FORCEINLINE FPoolStatistics FAdvancedObjectPool<T>::GetStatistics() const
+{
+    FScopeLock Lock(&PoolMutex);
+    return Statistics;
+}
+
+template<typename T>
+FORCEINLINE void FAdvancedObjectPool<T>::UpdateStatistics()
+{
+    // Update hit rate
+    int32 TotalRequests = Statistics.CacheHits + Statistics.CacheMisses;
+    if (TotalRequests > 0)
+    {
+        Statistics.HitRate = static_cast<float>(Statistics.CacheHits) / static_cast<float>(TotalRequests);
+    }
+    
+    // Update memory usage if tracking is enabled
+    if (Config.bEnableMemoryTracking)
+    {
+        float TotalMemoryKB = 0.0f;
+        for (const FAdvancedPooledObject& PooledObject : Pool)
+        {
+            TotalMemoryKB += PooledObject.MemoryFootprintKB;
+        }
+        Statistics.MemoryUsageMB = TotalMemoryKB / 1024.0f;
+    }
+    
+    // Update current counts
+    Statistics.CurrentPooledObjects = Pool.Num();
+    Statistics.AvailableObjects = AvailableIndices.Num();
+    Statistics.ActiveObjects = Pool.Num() - AvailableIndices.Num();
+}
+
+template<typename T>
+FORCEINLINE bool FAdvancedObjectPool<T>::IsHealthy() const
+{
+    FScopeLock Lock(&PoolMutex);
+    return Statistics.bIsHealthy;
+}
+
+template<typename T>
+void FAdvancedObjectPool<T>::ResetStatistics()
+{
+    FScopeLock Lock(&PoolMutex);
+    
+    // Preserve essential current state information
+    int32 CurrentPooledObjects = Statistics.CurrentPooledObjects;
+    int32 ActiveObjects = Statistics.ActiveObjects;
+    int32 AvailableObjects = Statistics.AvailableObjects;
+    int32 MaxPoolSize = Statistics.MaxPoolSize;
+    bool bIsHealthy = Statistics.bIsHealthy;
+    float MemoryUsageMB = Statistics.MemoryUsageMB;
+    
+    // Reset statistics to defaults
+    Statistics = FPoolStatistics();
+    
+    // Restore current state
+    Statistics.CurrentPooledObjects = CurrentPooledObjects;
+    Statistics.ActiveObjects = ActiveObjects;
+    Statistics.AvailableObjects = AvailableObjects;
+    Statistics.MaxPoolSize = MaxPoolSize;
+    Statistics.bIsHealthy = bIsHealthy;
+    Statistics.MemoryUsageMB = MemoryUsageMB;
+    
+    if (Config.bEnableDebugLogging) 
+    {
+        UE_LOG(LogObjectPool, Log, TEXT("Pool [%s]: Statistics reset"), *ObjectClass->GetName());
+    }
+}
+
+template<typename T>
+void FAdvancedObjectPool<T>::UpdateConfig(const FObjectPoolConfig& NewConfig)
+{
+    FScopeLock Lock(&PoolMutex);
+    
+    FObjectPoolConfig OldConfig = Config;
+    Config = NewConfig;
+    
+    // Update statistics max pool size
+    Statistics.MaxPoolSize = Config.MaxSize;
+    
+    // Handle size changes
+    if (Config.MaxSize < OldConfig.MaxSize && Pool.Num() > Config.MaxSize)
+    {
+        // Need to shrink pool - remove excess objects from available queue
+        TQueue<int32> NewAvailableIndices;
+        int32 TargetSize = FMath::Min(Pool.Num(), Config.MaxSize);
+        
+        while (!AvailableIndices.IsEmpty() && Pool.Num() > TargetSize)
+        {
+            int32 ObjectIndex;
+            AvailableIndices.Dequeue(ObjectIndex);
+            
+            if (Pool.IsValidIndex(ObjectIndex))
+            {
+                if (Pool.Num() <= TargetSize)
+                {
+                    NewAvailableIndices.Enqueue(ObjectIndex);
+                }
+                else
+                {
+                    DestroyObjectInternal(ObjectIndex);
+                }
+            }
+        }
+        AvailableIndices = NewAvailableIndices;
+    }
+    
+    UpdateStatistics();
+    
+    if (Config.bEnableDebugLogging) 
+    {
+        UE_LOG(LogObjectPool, Log, TEXT("Pool [%s]: Configuration updated. New MaxSize: %d"), 
+               *ObjectClass->GetName(), Config.MaxSize);
+    }
+}

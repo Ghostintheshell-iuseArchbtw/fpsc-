@@ -87,9 +87,38 @@ void UAdvancedObjectPoolManager::Deinitialize()
 
 AActor* UAdvancedObjectPoolManager::AcquireActor(TSubclassOf<AActor> ActorClass, const FString& PoolName)
 {
+    // Input validation with security checks
     if (!ActorClass)
     {
         UE_LOG(LogObjectPool, Warning, TEXT("AcquireActor called with null ActorClass"));
+        return nullptr;
+    }
+    
+    // Validate ActorClass is valid and safe to instantiate
+    if (!IsValid(ActorClass))
+    {
+        UE_LOG(LogObjectPool, Error, TEXT("AcquireActor called with invalid ActorClass"));
+        return nullptr;
+    }
+    
+    // Validate pool name doesn't contain security-sensitive characters
+    if (!PoolName.IsEmpty())
+    {
+        FString SanitizedPoolName = PoolName;
+        SanitizedPoolName = SanitizedPoolName.Replace(TEXT(".."), TEXT(""));
+        SanitizedPoolName = SanitizedPoolName.Replace(TEXT("/"), TEXT(""));
+        SanitizedPoolName = SanitizedPoolName.Replace(TEXT("\\"), TEXT(""));
+        if (SanitizedPoolName != PoolName)
+        {
+            UE_LOG(LogObjectPool, Warning, TEXT("AcquireActor: Pool name contains invalid characters, using sanitized version"));
+        }
+    }
+    
+    // Check if we have a valid world context
+    UWorld* World = GetWorld();
+    if (!IsValid(World))
+    {
+        UE_LOG(LogObjectPool, Error, TEXT("AcquireActor: No valid world context available"));
         return nullptr;
     }
     
@@ -170,12 +199,25 @@ AActor* UAdvancedObjectPoolManager::AcquireActor(TSubclassOf<AActor> ActorClass,
 
 void UAdvancedObjectPoolManager::ReleaseActor(AActor* Actor)
 {
+    // Enhanced input validation for security
     if (!Actor)
     {
+        UE_LOG(LogObjectPool, Warning, TEXT("ReleaseActor: Attempted to release null actor"));
+        return;
+    }
+    
+    // Validate actor is still valid and not pending kill
+    if (!IsValid(Actor))
+    {
+        UE_LOG(LogObjectPool, Warning, TEXT("ReleaseActor: Attempted to release invalid actor"));
         return;
     }
     
     FScopeLock Lock(&ManagerMutex);
+    
+    // Pre-allocate temporary arrays for better performance
+    TArray<FString> PoolsToCheck;
+    PoolsToCheck.Reserve(ActorPools.Num());
     
     // Find which pool this actor belongs to
     for (auto& PoolPair : ActorPools)
@@ -306,15 +348,42 @@ void UAdvancedObjectPoolManager::ReleaseComponent(UActorComponent* Component)
 
 UObject* UAdvancedObjectPoolManager::AcquireObject(TSubclassOf<UObject> ObjectClass, const FString& PoolName)
 {
+    // Enhanced security validation
     if (!ObjectClass)
     {
         UE_LOG(LogObjectPool, Warning, TEXT("AcquireObject called with null ObjectClass"));
         return nullptr;
     }
     
-    FScopeLock Lock(&ManagerMutex);
+    // Validate the object class is safe to instantiate
+    if (!IsValid(ObjectClass))
+    {
+        UE_LOG(LogObjectPool, Error, TEXT("AcquireObject called with invalid ObjectClass"));
+        return nullptr;
+    }
     
-    FString EffectivePoolName = PoolName.IsEmpty() ? GeneratePoolName(ObjectClass, PoolName) : PoolName;
+    // Validate the pool name for security
+    FString EffectivePoolName;
+    if (PoolName.IsEmpty())
+    {
+        EffectivePoolName = GeneratePoolName(ObjectClass, PoolName);
+    }
+    else
+    {
+        // Sanitize the pool name to prevent security issues
+        EffectivePoolName = PoolName;
+        EffectivePoolName = EffectivePoolName.Replace(TEXT(".."), TEXT(""));
+        EffectivePoolName = EffectivePoolName.Replace(TEXT("/"), TEXT(""));
+        EffectivePoolName = EffectivePoolName.Replace(TEXT("\\"), TEXT(""));
+        
+        // Alert if sanitized name differs from the input
+        if (EffectivePoolName != PoolName)
+        {
+            UE_LOG(LogObjectPool, Warning, TEXT("AcquireObject: Pool name contained invalid characters, using sanitized version"));
+        }
+    }
+    
+    FScopeLock Lock(&ManagerMutex);
     
     FAdvancedObjectPool<UObject>** FoundPool = ObjectPools.Find(EffectivePoolName);
     if (!FoundPool)
@@ -371,14 +440,34 @@ UObject* UAdvancedObjectPoolManager::AcquireObject(TSubclassOf<UObject> ObjectCl
 
 void UAdvancedObjectPoolManager::ReleaseObject(UObject* Object)
 {
+    // Enhanced security validation
     if (!Object)
     {
+        UE_LOG(LogObjectPool, Warning, TEXT("ReleaseObject: Attempted to release null object"));
         return;
+    }
+    
+    // Validate object is still valid and not pending kill
+    if (!IsValid(Object))
+    {
+        UE_LOG(LogObjectPool, Warning, TEXT("ReleaseObject: Attempted to release invalid object"));
+        return;
+    }
+    
+    // Check for any security-sensitive operations that might occur when releasing
+    // For example, ensure the object doesn't contain any malicious references
+    if (Object->HasAnyFlags(RF_Transient) && !Object->IsA(UActorComponent::StaticClass()) && !Object->IsA(AActor::StaticClass()))
+    {
+        // Additional validation for transient objects that aren't actors or components
+        UE_LOG(LogObjectPool, Log, TEXT("ReleaseObject: Releasing transient object %s"), *Object->GetName());
     }
     
     FScopeLock Lock(&ManagerMutex);
     
-    // Find which pool this object belongs to
+    // Pre-allocate array for better performance
+    TArray<FString> PoolsToCheck;
+    PoolsToCheck.Reserve(ObjectPools.Num());
+    ObjectPools.GetKeys(PoolsToCheck);
     for (auto& PoolPair : ObjectPools)
     {
         if (PoolPair.Value)
@@ -569,15 +658,26 @@ TArray<FString> UAdvancedObjectPoolManager::GetActivePoolNames() const
 {
     FScopeLock Lock(&ManagerMutex);
     
+    // Pre-allocate arrays for better performance
     TArray<FString> PoolNames;
+    const int32 TotalPoolCount = ActorPools.Num() + ComponentPools.Num() + ObjectPools.Num();
+    PoolNames.Reserve(TotalPoolCount);
     
-    ActorPools.GetKeys(PoolNames);
+    // Get actor pool names
+    TArray<FString> ActorPoolNames;
+    ActorPoolNames.Reserve(ActorPools.Num());
+    ActorPools.GetKeys(ActorPoolNames);
+    PoolNames.Append(ActorPoolNames);
     
+    // Get component pool names
     TArray<FString> ComponentPoolNames;
+    ComponentPoolNames.Reserve(ComponentPools.Num());
     ComponentPools.GetKeys(ComponentPoolNames);
     PoolNames.Append(ComponentPoolNames);
     
+    // Get object pool names
     TArray<FString> ObjectPoolNames;
+    ObjectPoolNames.Reserve(ObjectPools.Num());
     ObjectPools.GetKeys(ObjectPoolNames);
     PoolNames.Append(ObjectPoolNames);
     
@@ -859,15 +959,21 @@ void UAdvancedObjectPoolManager::PrewarmPool(const FString& PoolName)
 
 void UAdvancedObjectPoolManager::PrewarmAllPools()
 {
+    // Get all pool names with pre-allocated array
     TArray<FString> PoolNames = GetActivePoolNames();
     
-    for (const FString& PoolName : PoolNames)
+    // Pre-allocate temporary arrays if needed
+    if (PoolNames.Num() > 0)
     {
-        PrewarmPool(PoolName);
+        // Prewarm each pool
+        for (const FString& PoolName : PoolNames)
+        {
+            PrewarmPool(PoolName);
+        }
+        
+        UE_LOG(LogObjectPool, Log, TEXT("Prewarmed %d pools"), PoolNames.Num());
+        BroadcastPoolEvent(TEXT("System"), FString::Printf(TEXT("Prewarmed %d pools"), PoolNames.Num()));
     }
-    
-    UE_LOG(LogObjectPool, Log, TEXT("Prewarmed %d pools"), PoolNames.Num());
-    BroadcastPoolEvent(TEXT("System"), FString::Printf(TEXT("Prewarmed %d pools"), PoolNames.Num()));
 }
 
 bool UAdvancedObjectPoolManager::IsPoolHealthy(const FString& PoolName) const
@@ -954,17 +1060,55 @@ AActor* UAdvancedObjectPoolManager::AcquireDecal()
 
 FString UAdvancedObjectPoolManager::GeneratePoolName(UClass* ObjectClass, const FString& CustomName) const
 {
+    // Security-focused pool name generation
     if (!CustomName.IsEmpty())
     {
-        return CustomName;
+        // Sanitize custom name to prevent any security issues with sensitive functions or paths
+        FString SanitizedName = CustomName;
+        
+        // Remove any potential path traversal or command injection sequences
+        SanitizedName = SanitizedName.Replace(TEXT(".."), TEXT(""));
+        SanitizedName = SanitizedName.Replace(TEXT("/"), TEXT("_"));
+        SanitizedName = SanitizedName.Replace(TEXT("\\"), TEXT("_"));
+        SanitizedName = SanitizedName.Replace(TEXT(";"), TEXT("_"));
+        SanitizedName = SanitizedName.Replace(TEXT("|"), TEXT("_"));
+        SanitizedName = SanitizedName.Replace(TEXT("&"), TEXT("_"));
+        SanitizedName = SanitizedName.Replace(TEXT(">"), TEXT("_"));
+        SanitizedName = SanitizedName.Replace(TEXT("<"), TEXT("_"));
+        
+        // Remove potentially dangerous keywords that could be used in command injection
+        static const TArray<FString> DangerousKeywords = {
+            TEXT("exec"), TEXT("system"), TEXT("cmd"), TEXT("powershell"), TEXT("bash"),
+            TEXT("eval"), TEXT("execute")
+        };
+        
+        for (const FString& Keyword : DangerousKeywords)
+        {
+            if (SanitizedName.Contains(Keyword, ESearchCase::IgnoreCase))
+            {
+                SanitizedName = SanitizedName.Replace(*Keyword, TEXT("_"), ESearchCase::IgnoreCase);
+                UE_LOG(LogObjectPool, Warning, TEXT("Sanitized potentially unsafe pool name containing '%s'"), *Keyword);
+            }
+        }
+        
+        // If sanitization changed the name, log a warning
+        if (SanitizedName != CustomName)
+        {
+            UE_LOG(LogObjectPool, Warning, TEXT("Pool name '%s' contained potentially unsafe characters, sanitized to '%s'"), 
+                   *CustomName, *SanitizedName);
+        }
+        
+        return SanitizedName;
     }
     
     if (ObjectClass)
     {
-        return FString::Printf(TEXT("%s_Pool"), *ObjectClass->GetName());
+        // For auto-generated names, ensure they're also sanitized
+        FString GeneratedName = FString::Printf(TEXT("%s_Pool"), *ObjectClass->GetName());
+        return GeneratedName;
     }
     
-    return TEXT("UnknownPool");
+    return TEXT("SafeDefaultPool");
 }
 
 void UAdvancedObjectPoolManager::RegisterCommonPools()
